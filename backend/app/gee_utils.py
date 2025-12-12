@@ -1,6 +1,5 @@
 # app/gee_utils.py
 import os
-import json
 import uuid
 import requests
 import ee
@@ -20,7 +19,7 @@ RESULTS_DIR = os.getenv("RESULTS_DIR", "./results")
 # Thumbnail scale
 THUMBNAIL_SCALE = int(os.getenv("THUMBNAIL_SCALE", "30"))
 
-# Ensure results dir exists AFTER env loaded
+# Ensure results folder exists
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 
@@ -47,23 +46,23 @@ def init_ee():
 
 
 # -------------------------------
-# MAIN PROCESSING FUNCTION
+# Main Processing Function
 # -------------------------------
 def compute_ndvi_zscore_and_vectors(aoi_geojson, start_date, end_date, satellite="sentinel_2"):
     """
-    1. Load Sentinel-2 data
+    1. Load Sentinel-2 SR
     2. Compute NDVI
     3. Compute NDVI z-score
-    4. Detect anomaly mask
-    5. Convert anomalies → vectors (GeoJSON)
-    6. Generate thumbnail (local file)
+    4. Detect anomaly mask (z < -2)
+    5. Convert anomalies → vectors → getDownloadURL()
+    6. Generate thumbnail
     """
 
     # Convert AOI to Earth Engine geometry
     geom = ee.Geometry(aoi_geojson)
 
     # ----------------------------------------------------
-    # Load satellite collection
+    # Load Sentinel-2 Surface Reflectance (NO QA60 band)
     # ----------------------------------------------------
     if satellite.lower().startswith("sentinel"):
         col = (
@@ -73,11 +72,15 @@ def compute_ndvi_zscore_and_vectors(aoi_geojson, start_date, end_date, satellite
             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 40))
         )
 
+        # SCL → Scene Classification Layer (cloud mask)
         def mask_s2(img):
-            qa = img.select("QA60")
-            cloud = 1 << 10
-            cirrus = 1 << 11
-            mask = qa.bitwiseAnd(cloud).eq(0).And(qa.bitwiseAnd(cirrus).eq(0))
+            scl = img.select("SCL")
+            # Keep good classes: vegetation, bare soil, water, etc.
+            mask = scl.remap(
+                [3, 4, 5, 6, 7, 11],   # Allowed SCL classes
+                [1, 1, 1, 1, 1, 1],
+                0
+            )
             return img.updateMask(mask)
 
         col = col.map(mask_s2)
@@ -97,7 +100,7 @@ def compute_ndvi_zscore_and_vectors(aoi_geojson, start_date, end_date, satellite
     ndvi_mean = col_ndvi.mean()
     ndvi_std = col_ndvi.reduce(ee.Reducer.stdDev())
 
-    # Latest image
+    # Latest NDVI image
     latest = ee.Image(col_ndvi.sort("system:time_start", False).first())
 
     # Z-score = (latest - mean) / std
@@ -107,26 +110,27 @@ def compute_ndvi_zscore_and_vectors(aoi_geojson, start_date, end_date, satellite
         .rename("zscore")
     )
 
-    # Anomalies = z < -2
+    # Anomaly mask = z < -2
     anomaly_mask = zscore.lt(-2).selfMask().rename("anomaly")
 
     # ----------------------------------------------------
-    # Convert anomaly raster → vectors
+    # Convert raster → vector polygons (safe settings)
     # ----------------------------------------------------
     vectors = anomaly_mask.reduceToVectors(
         geometry=geom,
         scale=10,
         geometryType="polygon",
         eightConnected=True,
-        maxPixels=1e8
+        maxPixels=1e7,
+        bestEffort=True,
+        tileScale=4
     )
 
+    # Instead of getInfo() → return download URL
     try:
-        vectors_geojson = vectors.getInfo()  # WARNING: Large AOI → failure
+        vectors_url = vectors.getDownloadURL("geojson")
     except Exception as e:
-        raise RuntimeError(
-            f"ERROR: reduceToVectors/getInfo failed. AOI too large. {e}"
-        )
+        raise RuntimeError(f"ERROR: reduceToVectors failed. AOI too large. {e}")
 
     # ----------------------------------------------------
     # Generate thumbnail
@@ -134,7 +138,7 @@ def compute_ndvi_zscore_and_vectors(aoi_geojson, start_date, end_date, satellite
     vis_params = {
         "min": -3,
         "max": 3,
-        "palette": ["00ff00", "ffff00", "ff0000"],  # green → yellow → red
+        "palette": ["00ff00", "ffff00", "ff0000"],
     }
 
     try:
@@ -151,8 +155,8 @@ def compute_ndvi_zscore_and_vectors(aoi_geojson, start_date, end_date, satellite
     except Exception:
         thumb_url = None
 
+    # Download thumbnail locally
     local_thumb_path = None
-
     if thumb_url:
         try:
             resp = requests.get(thumb_url, timeout=60)
@@ -164,4 +168,7 @@ def compute_ndvi_zscore_and_vectors(aoi_geojson, start_date, end_date, satellite
         except Exception:
             local_thumb_path = None
 
-    return vectors_geojson, local_thumb_path
+    # -------------------------------
+    # Return download URL + thumbnail
+    # -------------------------------
+    return vectors_url, local_thumb_path
