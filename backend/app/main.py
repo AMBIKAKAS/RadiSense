@@ -1,86 +1,57 @@
-# app/main.py
-import os
+import ee
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.schemas import AnalysisRequest
-from app import gee_utils
-import ee
+from app.gee_utils import init_ee, detect_radiation_signals
 
-RESULTS_DIR = os.environ.get("RESULTS_DIR", "results")
-os.makedirs(RESULTS_DIR, exist_ok=True)
+# ================= FASTAPI APP =================
+app = FastAPI(
+    title="RadiSense – Radiation Leak Detection API",
+    version="1.0.0"
+)
 
-app = FastAPI(title="Radiation Anomaly Detector (GEE baseline)")
+# ================= CORS (CRITICAL FIX) =================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # Next.js frontend
+    allow_credentials=True,
+    allow_methods=["*"],  # allows OPTIONS, POST, GET
+    allow_headers=["*"],
+)
 
-app.mount("/results", StaticFiles(directory=RESULTS_DIR), name="results")
-
-
+# ================= HEALTH CHECK =================
 @app.get("/api/v1/health")
 def health():
     return {"status": "ok"}
 
-
+# ================= ANALYSIS ENDPOINT =================
 @app.post("/api/v1/analyze")
 async def analyze(req: AnalysisRequest):
-
     # Ensure Earth Engine is initialized
     try:
         ee.data.getInfo()
     except Exception:
-        try:
-            gee_utils.init_ee()
-            print("✔ Earth Engine re-initialized")
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Earth Engine init error: {e}"
-            )
+        init_ee()
 
-    aoi = req.aoi.dict()   # <<< IMPORTANT FIX
-    start_date = req.start_date
-    end_date = req.end_date
-    satellite = req.satellite or "sentinel_2"
-
-    if not aoi or not start_date or not end_date:
-        raise HTTPException(status_code=400, detail="Missing aoi or date range")
-
-    # Run anomaly detection
     try:
-        vectors_geojson, local_thumb_path = gee_utils.compute_ndvi_zscore_and_vectors(
-            aoi_geojson=aoi,
-            start_date=start_date,
-            end_date=end_date,
-            satellite=satellite
+        result = detect_radiation_signals(
+            aoi=req.aoi.dict(),
+            start=req.start_date,
+            end=req.end_date
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    # Count polygons
-    num_polygons = 0
-    if isinstance(vectors_geojson, dict):
-        num_polygons = len(vectors_geojson.get("features", []))
-
-    # Build thumbnail public URL
-    thumbnail_url = None
-    if local_thumb_path:
-        thumbnail_url = "/results/" + os.path.basename(local_thumb_path)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Detection failed: {e}"
+        )
 
     return JSONResponse(
         content={
             "status": "success",
-            "summary": {
-                "num_polygons": num_polygons
-            },
-            "polygons": vectors_geojson,
-            "thumbnail_url": thumbnail_url
+            "risk_score": result["risk_score"],
+            "risk_level": result["risk_level"],
+            "anomaly_vectors": result["vectors"]
         }
     )
-
-
-@app.get("/api/v1/results/{filename}")
-def get_result_file(filename: str):
-    filepath = os.path.join(RESULTS_DIR, filename)
-    if not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(filepath, media_type="image/png")

@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+body {
+  background: #050b18;
+  color: white;
+}
+.leaflet-container {
+  height: 100%;
+  width: 100%;
+}
